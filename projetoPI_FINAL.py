@@ -128,11 +128,11 @@ def verificarMaquina():
     listaAtual = obterListaMacs()
 
     for macItem in listaAtual:
-        macLimpo = macItem.replace(":", "")
+        macLimpo = macItem.replace(":", "").replace("-", "")
         cursor.execute(
             """
             SELECT id, mac_address FROM maquina
-            WHERE REPLACE(UPPER(mac_address), ':', '') = %s
+            WHERE REPLACE(REPLACE(UPPER(mac_address), ':', ''), '-', '') = %s
               AND ativo = 1
             LIMIT 1
             """,
@@ -146,39 +146,8 @@ def verificarMaquina():
     macPrincipal = listaAtual[0]
     macFormatado = macPrincipal
 
-    cursor.execute(
-        """
-        SELECT e.id FROM eta e
-        INNER JOIN cco c ON e.fk_cco = c.id
-        WHERE c.ativo = 1
-        ORDER BY e.id ASC
-        LIMIT 1
-        """
-    )
-    resultadoETA = cursor.fetchone()
-
-    if resultadoETA is None:
-        print("Nenhuma ETA cadastrada. Cadastre uma ETA pelo site antes de capturar dados.")
-        return None
-
-    cursor.execute(
-        """
-        INSERT INTO maquina
-        (hostname, mac_address, sistema_operacional, versao_so, data_cadastro, fk_eta, ativo)
-        VALUES (%s, %s, %s, %s, %s, %s, 1)
-        """,
-        (
-            socket.gethostname()[:100],
-            macPrincipal,
-            platform.system()[:45],
-            platform.release()[:45],
-            datetime.now(),
-            resultadoETA[0]
-        )
-    )
-
-    banco.commit()
-    return cursor.lastrowid
+    print(f"Maquina ({macPrincipal}) ainda nao cadastrada. Cadastre este MAC pelo site primeiro.")
+    return None
 
 def obterIdComponente(nomeComponente):
     idMedida = obterIdMedidaPorcentagem()
