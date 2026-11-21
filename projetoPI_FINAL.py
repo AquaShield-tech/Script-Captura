@@ -48,19 +48,43 @@ def garantirConexao():
         cursor = banco.cursor()
 
 
-# Obtém o endereço MAC da máquina no formato AA:BB:CC:DD:EE:FF 
-macNumero = uuid.getnode()
-macFormatado = ""
+# lista de mac address da máquina
+def obterListaMacs():
+    macsAtivos = []
+    macsSecundarios = []
+    stats = psutil.net_if_stats()
 
-for i in range(5, -1, -1):
-    parteMacTexto = "{:02X}".format((macNumero >> (i * 8)) & 0xff)
+    for nomeInterface, enderecos in psutil.net_if_addrs().items():
+        if nomeInterface.lower().startswith("lo"):
+            continue
 
-    if macFormatado == "":
-        macFormatado = parteMacTexto
-    else:
-        macFormatado += ":" + parteMacTexto
+        estaAtiva = stats[nomeInterface].isup if nomeInterface in stats else False
 
-macSemPontuacao = macFormatado.replace(":", "")
+        for endereco in enderecos:
+            if endereco.family == psutil.AF_LINK:
+                mac = endereco.address.replace("-", ":").strip().upper()
+                if len(mac) == 17 and mac not in ("00:00:00:00:00:00", "FF:FF:FF:FF:FF:FF"):
+                    # Evita priorizar adaptador virtual do VirtualBox (0A:00:27)
+                    if estaAtiva and not mac.startswith("0A:00:27"):
+                        if mac not in macsAtivos:
+                            macsAtivos.append(mac)
+                    else:
+                        if mac not in macsSecundarios:
+                            macsSecundarios.append(mac)
+
+    listaFinal = macsAtivos + macsSecundarios
+    if not listaFinal:
+        macNumero = uuid.getnode()
+        macFallback = ":".join(["{:02X}".format((macNumero >> (i * 8)) & 0xff) for i in range(5, -1, -1)])
+        listaFinal.append(macFallback)
+
+    return listaFinal
+
+
+listaMacs = obterListaMacs()
+macFormatado = listaMacs[0]
+
+
 
 def obterIdMedidaPorcentagem():
     cursor.execute(
@@ -100,20 +124,27 @@ def obterIdAlerta():
     return cursor.lastrowid
 
 def verificarMaquina():
-    cursor.execute(
-        """
-        SELECT id FROM maquina
-        WHERE REPLACE(UPPER(mac_address), ':', '') = %s
-          AND ativo = 1
-        LIMIT 1
-        """,
-        (macSemPontuacao,)
-    )
+    global macFormatado
+    listaAtual = obterListaMacs()
 
-    resultado = cursor.fetchone()
+    for macItem in listaAtual:
+        macLimpo = macItem.replace(":", "")
+        cursor.execute(
+            """
+            SELECT id, mac_address FROM maquina
+            WHERE REPLACE(UPPER(mac_address), ':', '') = %s
+              AND ativo = 1
+            LIMIT 1
+            """,
+            (macLimpo,)
+        )
+        resultado = cursor.fetchone()
+        if resultado is not None:
+            macFormatado = resultado[1]
+            return resultado[0]
 
-    if resultado is not None:
-        return resultado[0]
+    macPrincipal = listaAtual[0]
+    macFormatado = macPrincipal
 
     cursor.execute(
         """
@@ -124,7 +155,6 @@ def verificarMaquina():
         LIMIT 1
         """
     )
-
     resultadoETA = cursor.fetchone()
 
     if resultadoETA is None:
@@ -139,7 +169,7 @@ def verificarMaquina():
         """,
         (
             socket.gethostname()[:100],
-            macFormatado,
+            macPrincipal,
             platform.system()[:45],
             platform.release()[:45],
             datetime.now(),
@@ -148,7 +178,6 @@ def verificarMaquina():
     )
 
     banco.commit()
-
     return cursor.lastrowid
 
 def obterIdComponente(nomeComponente):
