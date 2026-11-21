@@ -1,22 +1,27 @@
-import platform #captura dados do sistema operacional (Windows ou Linux)
-import os #Serve como ponte para interagir com o sistema operacional (Windows ou Linux)
-import socket #trabalha com conexões de rede e obtem informações relacionadas ao computador.
-import time #trabalha com tempo e pausas na execução do programa.
-import uuid #gera e trabalha com identificadores únicos.
-from datetime import datetime #Data e hora
-import subprocess #executar outros programas e comandos a partir do Python.
+import platform  # captura dados do sistema operacional (Windows ou Linux)
+import os  # serve como ponte para interagir com o sistema operacional e variáveis de ambiente
+import socket  # obtém informações de identificação do computador na rede (hostname)
+import sys  # permite identificar argumentos de execução (ex: --auto na EC2)
+import time  # trabalha com tempo e pausas na execução do programa
+import uuid  # gera e trabalha com identificadores únicos (MAC address)
+from datetime import datetime  # data e hora
 
-import mysql.connector #Conexão Mysql
-import psutil #obtem informações sobre os recursos e o desempenho do sistema operacional.
+import mysql.connector  # conexão MySQL
+import psutil  # obtém informações sobre os recursos e o desempenho do sistema operacional
 
 
-banco = mysql.connector.connect(
-    user="root",
-    password="@Timao123",
-    host="localhost",
-    database="aquashield"
-)
+# Conexão com o banco (usa variáveis de ambiente na EC2 ou os valores padrão locais)
+def conectarBanco():
+    return mysql.connector.connect(
+        user=os.getenv("DB_USER", "root"),
+        password=os.getenv("DB_PASSWORD", "@K8m1m4v3a12"),
+        host=os.getenv("DB_HOST", "localhost"),
+        port=int(os.getenv("DB_PORT", "3306")),
+        database=os.getenv("DB_NAME", "aquashield")
+    )
 
+
+banco = conectarBanco()
 cursor = banco.cursor()
 
 INTERVALO_CAPTURA = 5
@@ -34,13 +39,21 @@ LIMITE_LATENCIA_DISCO_ATENCAO = 25.0
 LIMITE_LATENCIA_DISCO_CRITICO = 50.0
 
 
-# Obtém o endereço MAC da máquina
+def garantirConexao():
+    global banco, cursor
+    try:
+        banco.ping(reconnect=True, attempts=3, delay=2)
+    except mysql.connector.Error:
+        banco = conectarBanco()
+        cursor = banco.cursor()
 
+
+# Obtém o endereço MAC da máquina no formato AA:BB:CC:DD:EE:FF 
 macNumero = uuid.getnode()
 macFormatado = ""
 
 for i in range(5, -1, -1):
-    parteMacTexto = "{:02x}".format((macNumero >> (i * 8)) & 0xff)
+    parteMacTexto = "{:02X}".format((macNumero >> (i * 8)) & 0xff)
 
     if macFormatado == "":
         macFormatado = parteMacTexto
@@ -49,11 +62,9 @@ for i in range(5, -1, -1):
 
 macSemPontuacao = macFormatado.replace(":", "")
 
-
-# Obtém o ID da unidade de medida de porcentagem
 def obterIdMedidaPorcentagem():
     cursor.execute(
-        "SELECT id FROM Medida WHERE unidade_medida = %s LIMIT 1",
+        "SELECT id FROM medida WHERE unidade_medida = %s LIMIT 1",
         ("%",)
     )
 
@@ -63,7 +74,7 @@ def obterIdMedidaPorcentagem():
         return resultado[0]
 
     cursor.execute(
-        "INSERT INTO Medida (unidade_medida) VALUES (%s)",
+        "INSERT INTO medida (unidade_medida) VALUES (%s)",
         ("%",)
     )
 
@@ -71,10 +82,8 @@ def obterIdMedidaPorcentagem():
 
     return cursor.lastrowid
 
-
-# Obtém o ID do alerta padrão
 def obterIdAlerta():
-    cursor.execute("SELECT id FROM Definicao_Alerta LIMIT 1")
+    cursor.execute("SELECT id FROM definicao_alerta LIMIT 1")
 
     resultado = cursor.fetchone()
 
@@ -82,19 +91,22 @@ def obterIdAlerta():
         return resultado[0]
 
     cursor.execute(
-        "INSERT INTO Definicao_Alerta (valor_limite) VALUES (%s)",
-        (80.0,)
+        "INSERT INTO definicao_alerta (valor_limite, fk_alerta_descricao) VALUES (%s, %s)",
+        (80.0, 2)
     )
 
     banco.commit()
 
     return cursor.lastrowid
 
-
-# Verifica se a máquina está cadastrada
 def verificarMaquina():
     cursor.execute(
-        "SELECT id FROM Maquina WHERE mac_address = %s LIMIT 1",
+        """
+        SELECT id FROM maquina
+        WHERE REPLACE(UPPER(mac_address), ':', '') = %s
+          AND ativo = 1
+        LIMIT 1
+        """,
         (macSemPontuacao,)
     )
 
@@ -103,25 +115,33 @@ def verificarMaquina():
     if resultado is not None:
         return resultado[0]
 
-    cursor.execute("SELECT id FROM ETA LIMIT 1")
+    cursor.execute(
+        """
+        SELECT e.id FROM eta e
+        INNER JOIN cco c ON e.fk_cco = c.id
+        WHERE c.ativo = 1
+        ORDER BY e.id ASC
+        LIMIT 1
+        """
+    )
 
     resultadoETA = cursor.fetchone()
 
     if resultadoETA is None:
-        print("Nenhuma ETA cadastrada. Cadastre uma ETA antes de capturar dados.")
+        print("Nenhuma ETA cadastrada. Cadastre uma ETA pelo site antes de capturar dados.")
         return None
 
     cursor.execute(
         """
-        INSERT INTO Maquina
-        (hostname, mac_address, sistema_operacional, versao_so, data_cadastro, fk_eta)
-        VALUES (%s, %s, %s, %s, %s, %s)
+        INSERT INTO maquina
+        (hostname, mac_address, sistema_operacional, versao_so, data_cadastro, fk_eta, ativo)
+        VALUES (%s, %s, %s, %s, %s, %s, 1)
         """,
         (
             socket.gethostname()[:100],
-            macSemPontuacao,
+            macFormatado,
             platform.system()[:45],
-            platform.release()[:10],
+            platform.release()[:45],
             datetime.now(),
             resultadoETA[0]
         )
@@ -131,15 +151,12 @@ def verificarMaquina():
 
     return cursor.lastrowid
 
-
-# Obtém o ID de um componente
-
 def obterIdComponente(nomeComponente):
     idMedida = obterIdMedidaPorcentagem()
 
     cursor.execute(
         """
-        SELECT id FROM Tipo_Componente
+        SELECT id FROM tipo_componente
         WHERE tipo = %s AND fk_medida = %s
         LIMIT 1
         """,
@@ -151,7 +168,7 @@ def obterIdComponente(nomeComponente):
     if resultadoTipo is None:
         cursor.execute(
             """
-            INSERT INTO Tipo_Componente (tipo, fk_medida)
+            INSERT INTO tipo_componente (tipo, fk_medida)
             VALUES (%s, %s)
             """,
             (nomeComponente, idMedida)
@@ -166,7 +183,7 @@ def obterIdComponente(nomeComponente):
 
     cursor.execute(
         """
-        SELECT id FROM Componente
+        SELECT id FROM componente
         WHERE fk_tipoComponente = %s
         LIMIT 1
         """,
@@ -182,7 +199,7 @@ def obterIdComponente(nomeComponente):
 
     cursor.execute(
         """
-        INSERT INTO Componente
+        INSERT INTO componente
         (valor_maximo, fk_tipoComponente, fk_definicaoAlerta)
         VALUES (%s, %s, %s)
         """,
@@ -198,7 +215,7 @@ def obterIdComponente(nomeComponente):
 def garantirConfiguracao(idMaquina, idComponente):
     cursor.execute(
         """
-        SELECT fk_statusMaquina FROM Configuracao
+        SELECT fk_statusMaquina FROM configuracao
         WHERE fk_maquina = %s AND fk_componente = %s
         LIMIT 1
         """,
@@ -209,7 +226,7 @@ def garantirConfiguracao(idMaquina, idComponente):
         return
 
     cursor.execute(
-        "SELECT id FROM Status_Maquina WHERE estado = %s LIMIT 1",
+        "SELECT id FROM status_maquina WHERE estado = %s LIMIT 1",
         ("Ativo",)
     )
 
@@ -217,7 +234,7 @@ def garantirConfiguracao(idMaquina, idComponente):
 
     if resultadoStatus is None:
         cursor.execute(
-            "INSERT INTO Status_Maquina (estado) VALUES (%s)",
+            "INSERT INTO status_maquina (estado) VALUES (%s)",
             ("Ativo",)
         )
 
@@ -230,7 +247,7 @@ def garantirConfiguracao(idMaquina, idComponente):
 
     cursor.execute(
         """
-        INSERT INTO Configuracao
+        INSERT INTO configuracao
         (fk_maquina, fk_componente, fk_statusMaquina)
         VALUES (%s, %s, %s)
         """,
@@ -239,23 +256,73 @@ def garantirConfiguracao(idMaquina, idComponente):
 
     banco.commit()
 
+# faz select no banco para pegar o gatilho do site 
+def obterLimitesAtuais(idComponente, nomeComponente):
+    limiteAtencao = LIMITE_CPU_ATENCAO
+    limiteCritico = LIMITE_CPU_CRITICO
+    idDefAtencao = 1
+    idDefCritico = 5
 
-# Salva uma leitura no banco de dados
+    if nomeComponente == "RAM":
+        limiteAtencao = LIMITE_MEMORIA_ATENCAO
+        limiteCritico = LIMITE_MEMORIA_CRITICO
+        idDefAtencao = 2
+        idDefCritico = 5
+    elif nomeComponente == "Disco":
+        limiteAtencao = LIMITE_ARMAZENAMENTO_ATENCAO
+        limiteCritico = LIMITE_ARMAZENAMENTO_CRITICO
+        idDefAtencao = 3
+        idDefCritico = 6
 
-def salvarLeitura(idMaquina, idComponente, valor):
+    cursor.execute(
+        """
+        SELECT
+            da.id,
+            da.valor_limite,
+            da_crit.id,
+            da_crit.valor_limite
+        FROM componente c
+        INNER JOIN definicao_alerta da ON c.fk_definicaoAlerta = da.id
+        LEFT JOIN definicao_alerta da_crit ON c.fk_definicaoAlertaCritico = da_crit.id
+        WHERE c.id = %s
+        LIMIT 1
+        """,
+        (idComponente,)
+    )
+    res = cursor.fetchone()
+    if res is not None:
+        idDefAtencao = res[0]
+        limiteAtencao = float(res[1])
+        if res[2] is not None and res[3] is not None:
+            idDefCritico = res[2]
+            limiteCritico = float(res[3])
+        else:
+            cursor.execute(
+                "SELECT valor_limite FROM definicao_alerta WHERE id = %s LIMIT 1",
+                (idDefCritico,)
+            )
+            resCritico = cursor.fetchone()
+            if resCritico is not None:
+                limiteCritico = float(resCritico[0])
+
+    return idDefAtencao, limiteAtencao, idDefCritico, limiteCritico
+
+# Salva uma leitura no banco de dados e registra alerta quando ultrapassar os limites
+def salvarLeitura(idMaquina, idComponente, nomeComponente, valor):
     idMedida = obterIdMedidaPorcentagem()
+    valorArredondado = round(float(valor), 2)
 
     garantirConfiguracao(idMaquina, idComponente)
 
     cursor.execute(
         """
-        INSERT INTO Leitura
+        INSERT INTO leitura
         (valor, data_hora, fk_medida,
         configuracao_fk_maquina, configuracao_fk_componente)
         VALUES (%s, %s, %s, %s, %s)
         """,
         (
-            round(float(valor), 2),
+            valorArredondado,
             datetime.now(),
             idMedida,
             idMaquina,
@@ -263,66 +330,59 @@ def salvarLeitura(idMaquina, idComponente, valor):
         )
     )
 
+    idLeitura = cursor.lastrowid
+    idDefAtencao, limiteAtencao, idDefCritico, limiteCritico = obterLimitesAtuais(idComponente, nomeComponente)
+    fkDefinicaoAlerta = None
 
-# Captura a atividade e a latência do disco no Windows
+    if nomeComponente in ("CPU", "RAM"):
+        if valorArredondado > limiteCritico:
+            fkDefinicaoAlerta = idDefCritico
+        elif valorArredondado >= limiteAtencao:
+            fkDefinicaoAlerta = idDefAtencao
+    elif nomeComponente == "Disco":
+        if valorArredondado >= limiteCritico:
+            fkDefinicaoAlerta = idDefCritico
+        elif valorArredondado >= limiteAtencao:
+            fkDefinicaoAlerta = idDefAtencao
 
+    if fkDefinicaoAlerta is not None:
+        cursor.execute(
+            "INSERT INTO leitura_alerta (fk_leitura, fk_definicaoAlerta) VALUES (%s, %s)",
+            (idLeitura, fkDefinicaoAlerta)
+        )
+
+# atividade e a latência do disco
 def capturarDadosDisco():
     try:
-        comando = """
-        $disco = Get-CimInstance Win32_PerfFormattedData_PerfDisk_PhysicalDisk |
-        Where-Object { $_.Name -eq '_Total' }
+        io_antes = psutil.disk_io_counters()
+        time.sleep(1)
+        io_depois = psutil.disk_io_counters()
 
-        if ($null -eq $disco) {
-            Write-Output 'ERRO'
-        } else {
-            Write-Output "$($disco.PercentDiskTime);$($disco.AvgDisksecPerRead * 1000);$($disco.AvgDisksecPerWrite * 1000)"
-        }
-        """
-
-        resultado = subprocess.run(
-            [
-                "powershell",
-                "-NoProfile",
-                "-Command",
-                comando
-            ],
-            capture_output=True,
-            text=True,
-            timeout=10
-        )
-
-        if resultado.returncode != 0:
-            print("Erro ao consultar o disco:", resultado.stderr.strip())
+        if not io_antes or not io_depois:
             return None, None, None
 
-        valores = resultado.stdout.strip()
+        reads = io_depois.read_count - io_antes.read_count
+        writes = io_depois.write_count - io_antes.write_count
+        read_time = io_depois.read_time - io_antes.read_time
+        write_time = io_depois.write_time - io_antes.write_time
 
-        if valores == "" or valores == "ERRO":
-            print("O Windows nao retornou dados do disco.")
-            return None, None, None
+        latenciaLeitura = (read_time / reads) if reads > 0 else 0.0
+        latenciaEscrita = (write_time / writes) if writes > 0 else 0.0
 
-        partes = valores.split(";")
+        if hasattr(io_depois, "busy_time"):
+            busy_time = io_depois.busy_time - io_antes.busy_time
+            atividade = min((busy_time / 1000.0) * 100.0, 100.0)
+        else:
+            atividade = 0.0
 
-        if len(partes) != 3:
-            return None, None, None
+        return atividade, latenciaLeitura, latenciaEscrita
 
-        atividade = float(partes[0])
-        latenciaLeitura = float(partes[1])
-        latenciaEscrita = float(partes[2])
-
-        return (
-            min(atividade, 100.0),
-            latenciaLeitura,
-            latenciaEscrita
-        )
-
-    except (ValueError, OSError, subprocess.TimeoutExpired) as erro:
+    except Exception as erro:
         print("Erro ao consultar os dados do disco:", erro)
         return None, None, None
 
 
 # Verifica os alertas dos componentes
-
 def gerarAlertas(
     usoCPU,
     usoMemoria,
@@ -336,7 +396,6 @@ def gerarAlertas(
     print("\n========== ALERTAS AQUASHIELD ==========")
 
     # Alertas da CPU
-
     if usoCPU is not None:
         if usoCPU > LIMITE_CPU_CRITICO:
             print("\nALERTA CRITICO: utilizacao da CPU acima de 80%.")
@@ -349,7 +408,6 @@ def gerarAlertas(
             alertasEncontrados = True
 
     # Alertas da memória RAM
-
     if usoMemoria is not None:
         if usoMemoria > LIMITE_MEMORIA_CRITICO:
             print("\nALERTA CRITICO: utilizacao da RAM acima de 80%.")
@@ -362,7 +420,6 @@ def gerarAlertas(
             alertasEncontrados = True
 
     # Alertas de armazenamento
-
     if armazenamentoDisco is not None:
         if armazenamentoDisco >= LIMITE_ARMAZENAMENTO_CRITICO:
             print("\nALERTA CRITICO: disco com 90% ou mais de ocupacao.")
@@ -378,7 +435,6 @@ def gerarAlertas(
             print("Espaco livre:", round(espacoLivreGB, 2), "GB")
 
     # Alertas de latência de leitura
-
     if latenciaLeitura is not None:
         if latenciaLeitura > LIMITE_LATENCIA_DISCO_CRITICO:
             print("\nALERTA CRITICO: latencia de leitura acima de 50 ms.")
@@ -391,7 +447,6 @@ def gerarAlertas(
             alertasEncontrados = True
 
     # Alertas de latência de escrita
-
     if latenciaEscrita is not None:
         if latenciaEscrita > LIMITE_LATENCIA_DISCO_CRITICO:
             print("\nALERTA CRITICO: latencia de escrita acima de 50 ms.")
@@ -407,9 +462,9 @@ def gerarAlertas(
         print("Nenhum alerta foi identificado nesta captura.")
 
 
-# Captura os dados dos componentes da máquina
-
+# dados dos componentes da máquina
 def capturarDados():
+    garantirConexao()
     idMaquina = verificarMaquina()
 
     if idMaquina is None:
@@ -423,34 +478,27 @@ def capturarDados():
     print("MAC:", macFormatado)
 
     usoCPU = psutil.cpu_percent(interval=1)
-
     usoMemoria = psutil.virtual_memory().percent
 
-    # Captura a ocupação e o espaço livre do disco do sistema
-
+    # ocupação e o espaço livre do disco do sistema
     try:
         disco = psutil.disk_usage(os.path.abspath(os.sep))
-        #O os.path.abspath(os.sep) identifica o caminho da raiz do sistema de arquivos.
         armazenamentoDisco = disco.percent
-
         espacoLivreGB = disco.free / (1024 ** 3)
 
     except OSError as erro:
         print("Nao foi possivel consultar o espaco do disco:", erro)
-
         armazenamentoDisco = None
         espacoLivreGB = None
 
-    # Captura a atividade e a latência do disco
-
+    # atividade e a latência do disco
     (
         atividadeDisco,
         latenciaLeitura,
         latenciaEscrita
     ) = capturarDadosDisco()
 
-    # Exibe os valores capturados
-
+    # valores capturados
     print("\nUso da CPU:", round(usoCPU, 2), "%")
     print("Uso da memoria RAM:", round(usoMemoria, 2), "%")
 
@@ -469,13 +517,11 @@ def capturarDados():
     if latenciaEscrita is not None:
         print("Latencia de escrita:", round(latenciaEscrita, 2), "ms")
 
-    # Componentes que serao salvos no banco
-
+    # Componentes salvo no banco (alinhado com a tabelas de tipo_componente, IDs 1,2,3,4)
     capturas = [
-        ("Uso da CPU", usoCPU),
-        ("Uso da Memoria", usoMemoria),
-        ("Uso do Disco", armazenamentoDisco),
-        ("Atividade do Disco", atividadeDisco)
+        ("CPU", usoCPU),
+        ("RAM", usoMemoria),
+        ("Disco", armazenamentoDisco)
     ]
 
     try:
@@ -489,9 +535,9 @@ def capturarDados():
             salvarLeitura(
                 idMaquina,
                 idComponente,
+                nomeComponente,
                 percentual
             )
-
 
         if espacoLivreGB is not None:
             print(
@@ -517,16 +563,14 @@ def capturarDados():
             latenciaEscrita
         )
 
-        print("\nCapturas salvas no banco de dados.")
+        print("\n[OK] Capturas salvas no banco de dados aquashield.")
 
     except mysql.connector.Error as erro:
         banco.rollback()
         print("Erro ao salvar a captura:", erro)
 
-
-# Exibe os dados salvos no banco
-
 def visualizarDados():
+    garantirConexao()
     idMaquina = verificarMaquina()
 
     if idMaquina is None:
@@ -535,15 +579,15 @@ def visualizarDados():
     cursor.execute(
         """
         SELECT tc.tipo, l.data_hora, l.valor, m.unidade_medida
-        FROM Leitura l
-        INNER JOIN Configuracao cfg
+        FROM leitura l
+        INNER JOIN configuracao cfg
             ON l.configuracao_fk_maquina = cfg.fk_maquina
             AND l.configuracao_fk_componente = cfg.fk_componente
-        INNER JOIN Componente c
+        INNER JOIN componente c
             ON cfg.fk_componente = c.id
-        INNER JOIN Tipo_Componente tc
+        INNER JOIN tipo_componente tc
             ON c.fk_tipoComponente = tc.id
-        INNER JOIN Medida m
+        INNER JOIN medida m
             ON l.fk_medida = m.id
         WHERE cfg.fk_maquina = %s
         ORDER BY l.data_hora DESC
@@ -572,8 +616,6 @@ def visualizarDados():
             str(linha[2]) + " " + linha[3]
         )
 
-# Realiza capturas automaticamente
-
 def capturaAutomatica():
     print("\n===== CAPTURA AUTOMATICA =====")
     print("Nova captura a cada", INTERVALO_CAPTURA, "segundos.")
@@ -587,37 +629,39 @@ def capturaAutomatica():
     except KeyboardInterrupt:
         print("\nCaptura automatica encerrada.")
 
-
-# Menu principal
-
+# verificação para ec2 e manual na máquina local
+# modo automático via argumento (--auto) ou menu interativo no terminal
 try:
-    while True:
-        print("\n==============================")
-        print("          AQUASHIELD")
-        print("==============================")
-        print("MAC:", macFormatado)
-        print("\n1 - Capturar dados")
-        print("2 - Captura automatica")
-        print("3 - Ver dados")
-        print("4- Sair")
+    if "--auto" in sys.argv or os.getenv("MODO_AUTOMATICO", "").lower() == "true":
+        capturaAutomatica()
+    else:
+        while True:
+            print("\n==============================")
+            print("          AQUASHIELD")
+            print("==============================")
+            print("MAC:", macFormatado)
+            print("\n1 - Capturar dados")
+            print("2 - Captura automatica")
+            print("3 - Ver dados")
+            print("4 - Sair")
 
-        opcao = input("Escolha uma opcao: ")
+            opcao = input("Escolha uma opcao: ")
 
-        if opcao == "1":
-            capturarDados()
+            if opcao == "1":
+                capturarDados()
 
-        elif opcao == "2":
-            capturaAutomatica()
+            elif opcao == "2":
+                capturaAutomatica()
 
-        elif opcao == "3":
-            visualizarDados()
+            elif opcao == "3":
+                visualizarDados()
 
-        elif opcao == "4":
-            print("Encerrando programa...")
-            break
+            elif opcao == "4":
+                print("Encerrando programa...")
+                break
 
-        else:
-            print("Opcao invalida.")
+            else:
+                print("Opcao invalida.")
 
 except KeyboardInterrupt:
     print("\nPrograma interrompido.")
