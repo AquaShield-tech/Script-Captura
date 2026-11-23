@@ -8,18 +8,17 @@ from datetime import datetime  # data e hora
 
 import mysql.connector  # conexão MySQL
 import psutil  # obtém informações sobre os recursos e o desempenho do sistema operacional
-
+import requests # Permite que o Python envie informações para outros sistemas pela internet. Envia mensagens para o Slack.
 
 # Conexão com o banco (usa variáveis de ambiente na EC2 ou os valores padrão locais)
 def conectarBanco():
     return mysql.connector.connect(
         user=os.getenv("DB_USER", "root"),
-        password=os.getenv("DB_PASSWORD", "@K8m1m4v3a12"),
+        password=os.getenv("DB_PASSWORD", "sua_senha"),
         host=os.getenv("DB_HOST", "localhost"),
         port=int(os.getenv("DB_PORT", "3306")),
         database=os.getenv("DB_NAME", "aquashield")
     )
-
 
 banco = conectarBanco()
 cursor = banco.cursor()
@@ -380,6 +379,141 @@ def capturarDadosDisco():
         return None, None, None
 
 
+SLACK_WEBHOOK_URL="adicione_a_WEBHOOK"
+
+# Intervalo de 5 minutos entre os alertas
+INTERVALO_ALERTA = 300
+
+# Guarda o horário do último alerta de cada componente
+ultimoAlerta = {}
+
+
+def enviarAlertaSlack(componente, nivel, valor, limite, unidade):
+
+    if not SLACK_WEBHOOK_URL:
+        print("URL do Slack não configurada.")
+        return False
+
+    hostname = socket.gethostname()
+    ipMaquina = socket.gethostbyname(hostname)
+    so = platform.system()
+    versaoSO = platform.release()
+
+    dataHora = datetime.now().strftime("%d/%m/%Y às %H:%M")
+
+    mensagem = (
+        f":warning: *ALERTA AQUASHIELD*\n\n"
+
+        f"*IDENTIFICAÇÃO DA MÁQUINA*\n"
+        f"*Hostname:* {hostname}\n"
+        f"*Endereço IP:* {ipMaquina}\n"
+        f"*Sistema operacional:* {so}\n"
+        f"*Versão:* {versaoSO}\n\n"
+
+        f"*INFORMAÇÕES DO ALERTA*\n"
+        f"*Componente:* {componente}\n"
+        f"*Nível:* {nivel}\n"
+        f"*Valor identificado:* {valor}{unidade}\n"
+        f"*Limite configurado:* {limite}{unidade}\n"
+        f"*Data e horário:* {dataHora}\n\n"
+
+        f"*AÇÃO RECOMENDADA*\n"
+        f"Verificar o consumo do componente e identificar "
+        f"possíveis sobrecargas no servidor SCADA."
+    )
+
+    # Envia a mensagem para o Slack
+    try:
+        resposta = requests.post(
+            SLACK_WEBHOOK_URL,
+            json={"text": mensagem},
+            timeout=5
+        )
+
+        resposta.raise_for_status()
+
+        print("Alerta enviado para o Slack!")
+
+    except requests.exceptions.RequestException as erro:
+        print("Erro ao enviar alerta para o Slack:", erro)
+        return False
+
+    # Registra os dados do alerta no banco de dados
+    try:
+        garantirConexao()
+
+        # Identifica a máquina pelo MAC cadastrado
+        idMaquina = verificarMaquina()
+
+        if idMaquina is None:
+            print("Não foi possível identificar a máquina no banco.")
+            return True
+
+        nomeComponenteBanco = componente
+
+        if componente.startswith("Latência"):
+            nomeComponenteBanco = "Disco"
+
+        idComponente = obterIdComponente(nomeComponenteBanco)
+
+        garantirConfiguracao(idMaquina, idComponente)
+
+        sql = """
+            INSERT INTO slack (
+                fk_maquina,
+                fk_componente,
+                nivelAlerta,
+                valorIdentificado,
+                limiteConfigurado
+            )
+            VALUES (%s, %s, %s, %s, %s)
+        """
+
+        valores = (
+            idMaquina,
+            idComponente,
+            nivel,
+            valor,
+            limite
+        )
+
+        cursor.execute(sql, valores)
+        banco.commit()
+
+        print("Alerta registrado na tabela Slack!")
+        print("ID da máquina:", idMaquina)
+        print("ID do componente:", idComponente)
+
+    except mysql.connector.Error as erro:
+        banco.rollback()
+        print("Erro ao registrar alerta no banco de dados:", erro)
+
+    return True
+
+
+def verificarAlertaSlack(componente, nivel, valor, limite, unidade):
+
+    if nivel == "CRÍTICO":
+
+        agora = time.time()
+
+        # Verifica se é o primeiro alerta ou se já passaram 5 minutos
+        if (componente not in ultimoAlerta or
+                agora - ultimoAlerta[componente] >= INTERVALO_ALERTA):
+
+            enviado = enviarAlertaSlack(
+                componente,
+                nivel,
+                valor,
+                limite,
+                unidade
+            )
+
+            # Atualiza o horário somente se o envio foi realizado
+            if enviado:
+                ultimoAlerta[componente] = agora
+
+
 # Verifica os alertas dos componentes
 def gerarAlertas(
     usoCPU,
@@ -400,6 +534,14 @@ def gerarAlertas(
             print("Uso atual:", round(usoCPU, 2), "%")
             alertasEncontrados = True
 
+            verificarAlertaSlack(
+                "CPU",
+                "CRÍTICO",
+                round(usoCPU, 2),
+                LIMITE_CPU_CRITICO,
+                "%"
+            )
+
         elif usoCPU >= LIMITE_CPU_ATENCAO:
             print("\nATENCAO: utilizacao da CPU acima de 50%.")
             print("Uso atual:", round(usoCPU, 2), "%")
@@ -412,6 +554,14 @@ def gerarAlertas(
             print("Uso atual:", round(usoMemoria, 2), "%")
             alertasEncontrados = True
 
+            verificarAlertaSlack(
+                "RAM",
+                "CRÍTICO",
+                round(usoMemoria, 2),
+                LIMITE_MEMORIA_CRITICO,
+                "%"
+            )
+
         elif usoMemoria >= LIMITE_MEMORIA_ATENCAO:
             print("\nATENCAO: utilizacao da RAM acima de 60%.")
             print("Uso atual:", round(usoMemoria, 2), "%")
@@ -423,6 +573,14 @@ def gerarAlertas(
             print("\nALERTA CRITICO: disco com 90% ou mais de ocupacao.")
             print("Ocupacao atual:", round(armazenamentoDisco, 2), "%")
             alertasEncontrados = True
+
+            verificarAlertaSlack(
+                "Disco",
+                "CRÍTICO",
+                round(armazenamentoDisco, 2),
+                LIMITE_ARMAZENAMENTO_CRITICO,
+                "%"
+            )
 
         elif armazenamentoDisco >= LIMITE_ARMAZENAMENTO_ATENCAO:
             print("\nATENCAO: disco com 80% ou mais de ocupacao.")
@@ -439,6 +597,14 @@ def gerarAlertas(
             print("Latencia atual:", round(latenciaLeitura, 2), "ms")
             alertasEncontrados = True
 
+            verificarAlertaSlack(
+                "Latência de leitura do disco",
+                "CRÍTICO",
+                round(latenciaLeitura, 2),
+                LIMITE_LATENCIA_DISCO_CRITICO,
+                " ms"
+            )
+
         elif latenciaLeitura > LIMITE_LATENCIA_DISCO_ATENCAO:
             print("\nATENCAO: latencia de leitura acima de 25 ms.")
             print("Latencia atual:", round(latenciaLeitura, 2), "ms")
@@ -450,6 +616,14 @@ def gerarAlertas(
             print("\nALERTA CRITICO: latencia de escrita acima de 50 ms.")
             print("Latencia atual:", round(latenciaEscrita, 2), "ms")
             alertasEncontrados = True
+
+            verificarAlertaSlack(
+                "Latência de escrita do disco",
+                "CRÍTICO",
+                round(latenciaEscrita, 2),
+                LIMITE_LATENCIA_DISCO_CRITICO,
+                " ms"
+            )
 
         elif latenciaEscrita > LIMITE_LATENCIA_DISCO_ATENCAO:
             print("\nATENCAO: latencia de escrita acima de 25 ms.")
